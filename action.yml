@@ -1,0 +1,29 @@
+name: Skipjack
+description: >-
+  Request repository-scoped secrets and variables from Skipjack using GitHub
+  Actions OIDC, then export them for subsequent steps.
+author: bitnixdev
+branding:
+  icon: lock
+  color: blue
+
+inputs:
+  url:
+    description: HTTPS base URL of the Skipjack deployment, such as https://skipjack.example.com
+    required: false
+    default: "https://skipjack.bitnix.dev"
+  org:
+    description: Skipjack organization slug; defaults to the GitHub repository owner
+    required: false
+    default: ""
+  project:
+    description: Skipjack project slug; defaults to the GitHub repository name
+    required: false
+    default: ""
+  audience:
+    description: OIDC audience; defaults to the normalized Skipjack URL
+    required: false
+    default: ""
+runs:
+  using: node24
+  main: dist/index.js

@@ -1,0 +1,24 @@
+{
+  "name": "@bitnixdev/skipjack",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --target=node24 --format=cjs --outfile=dist/index.js",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "dependencies": {
+    "@actions/core": "3.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.2",
+    "esbuild": "0.28.1",
+    "typescript": "6.0.3",
+    "vitest": "4.1.9"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
