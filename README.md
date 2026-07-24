@@ -24,13 +24,16 @@ jobs:
 
 The `id-token: write` permission is required for GitHub to mint the OIDC token.
 It does not grant this action write access to repository contents. Skipjack
-verifies the token and applies its policies to the token's repository, ref,
-environment, and reusable-workflow claims before returning any values.
+verifies the token against its configured OIDC workload identities and enforces
+their `secrets:r` and `variables:r` permissions.
 
 By default the action connects to `https://skipjack.bitnix.dev` and maps a
 workflow running in `owner/repository` to the lowercase Skipjack scope
 `owner/repository`. Each default can be overridden when using a different
 deployment or scope.
+
+The action reads both the organization and project scopes through Skipjack's
+`/v1` API. Project values override same-named organization values.
 
 ## Inputs
 

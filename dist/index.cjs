@@ -21050,17 +21050,11 @@ function normalizeUrl(value) {
   }
   return url.toString().replace(/\/+$/, "");
 }
-function isEnvironmentRecord(value) {
-  return typeof value === "object" && value !== null && !Array.isArray(value) && Object.entries(value).every(
-    ([name, entry]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && typeof entry === "string"
-  );
+function isNamedValue(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value) && typeof value.name === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(value.name) && typeof value.value === "string";
 }
-function isExchangeResponse(value) {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return false;
-  }
-  const response = value;
-  return isEnvironmentRecord(response.secrets) && (response.variables === void 0 || isEnvironmentRecord(response.variables)) && Array.isArray(response.grantedBy) && response.grantedBy.every((entry) => typeof entry === "string");
+function readNamedValues(value, key) {
+  return typeof value === "object" && value !== null && !Array.isArray(value) && Array.isArray(value[key]) && value[key].every(isNamedValue) ? value[key] : null;
 }
 async function readJson(response) {
   const text = await response.text();
@@ -21071,12 +21065,12 @@ async function readJson(response) {
     return void 0;
   }
 }
-function formatExchangeError(response, value, endpoint, scope) {
+function formatApiError(response, value, endpoint, scope) {
   const error2 = typeof value === "object" && value !== null ? value : void 0;
   const code = typeof error2?.error === "string" ? error2.error : "unknown_error";
   const detail = typeof error2?.detail === "string" ? `: ${error2.detail}` : "";
   const requestId = response.headers.get("x-request-id") ?? response.headers.get("cf-ray") ?? response.headers.get("traceparent") ?? "unavailable";
-  return `Skipjack rejected the exchange (HTTP ${response.status}, ${code})${detail}; scope=${scope}; endpoint=POST ${endpoint}; request-id=${requestId}`;
+  return `Skipjack API request failed (HTTP ${response.status}, ${code})${detail}; scope=${scope}; endpoint=GET ${endpoint}; request-id=${requestId}`;
 }
 async function run({
   core,
@@ -21096,10 +21090,25 @@ async function run({
   const org = configuredOrg || defaults.org;
   const project = configuredProject || defaults.project;
   const audience = core.getInput("audience") || url;
-  const endpoint = `${url}/oidc/secrets`;
   const scope = `${org}/${project}`;
+  const orgBase = `${url}/v1/orgs/${encodeURIComponent(org)}`;
+  const projectBase = `${orgBase}/projects/${encodeURIComponent(project)}`;
+  const requests = [
+    { endpoint: `${orgBase}/secrets`, key: "secrets", scope: org },
+    { endpoint: `${orgBase}/variables`, key: "variables", scope: org },
+    {
+      endpoint: `${projectBase}/secrets`,
+      key: "secrets",
+      scope
+    },
+    {
+      endpoint: `${projectBase}/variables`,
+      key: "variables",
+      scope
+    }
+  ];
   core.info(
-    `Requesting Skipjack exchange: endpoint=POST ${endpoint}; scope=${scope}; audience=${audience}; repository=${repository ?? "unset"}; ref=${ref ?? "unset"}; workflow=${workflow ?? "unset"}; job=${job ?? "unset"}; run=${runId ?? "unset"}; attempt=${runAttempt ?? "unset"}; event=${eventName ?? "unset"}`
+    `Requesting Skipjack resources from the /v1 workload identity API: scope=${scope}; audience=${audience}; repository=${repository ?? "unset"}; ref=${ref ?? "unset"}; workflow=${workflow ?? "unset"}; job=${job ?? "unset"}; run=${runId ?? "unset"}; attempt=${runAttempt ?? "unset"}; event=${eventName ?? "unset"}`
   );
   let idToken;
   try {
@@ -21110,45 +21119,71 @@ async function run({
     );
     return;
   }
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      accept: "application/json"
-    },
-    body: JSON.stringify({
-      token: idToken,
-      org,
-      project
+  const results = await Promise.all(
+    requests.map(async (request) => {
+      const response = await fetch(request.endpoint, {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${idToken}`,
+          accept: "application/json"
+        }
+      });
+      const requestId = response.headers.get("x-request-id") ?? response.headers.get("cf-ray") ?? response.headers.get("traceparent") ?? "unavailable";
+      core.info(
+        `Skipjack API response: HTTP ${response.status}; endpoint=GET ${request.endpoint}; content-type=${response.headers.get("content-type") ?? "unset"}; request-id=${requestId}`
+      );
+      return { ...request, response, payload: await readJson(response) };
     })
-  });
-  const requestId = response.headers.get("x-request-id") ?? response.headers.get("cf-ray") ?? response.headers.get("traceparent") ?? "unavailable";
-  core.info(
-    `Skipjack exchange response: HTTP ${response.status}; content-type=${response.headers.get("content-type") ?? "unset"}; request-id=${requestId}`
   );
-  const payload = await readJson(response);
-  if (!response.ok) {
-    core.setFailed(formatExchangeError(response, payload, endpoint, scope));
+  for (const result of results) {
+    if (!result.response.ok) {
+      core.setFailed(
+        formatApiError(
+          result.response,
+          result.payload,
+          result.endpoint,
+          result.scope
+        )
+      );
+      return;
+    }
+  }
+  const parsed = results.map((result) => ({
+    ...result,
+    values: readNamedValues(result.payload, result.key)
+  }));
+  const invalid = parsed.find((result) => result.values === null);
+  if (invalid) {
+    core.setFailed(
+      `Skipjack returned an invalid ${invalid.key} response; endpoint=GET ${invalid.endpoint}`
+    );
     return;
   }
-  if (!isExchangeResponse(payload)) {
-    core.setFailed("Skipjack returned an invalid exchange response");
-    return;
+  const orgSecrets = parsed[0].values;
+  const orgVariables = parsed[1].values;
+  const projectSecrets = parsed[2].values;
+  const projectVariables = parsed[3].values;
+  const secrets = {};
+  const variables = {};
+  for (const entry of [...orgSecrets, ...projectSecrets]) {
+    secrets[entry.name] = entry.value;
   }
-  const variables = payload.variables ?? {};
-  for (const value of Object.values(payload.secrets)) core.setSecret(value);
+  for (const entry of [...orgVariables, ...projectVariables]) {
+    variables[entry.name] = entry.value;
+  }
+  for (const value of Object.values(secrets)) core.setSecret(value);
   for (const [name, value] of Object.entries(variables)) {
     core.exportVariable(name, value);
   }
-  for (const [name, value] of Object.entries(payload.secrets)) {
+  for (const [name, value] of Object.entries(secrets)) {
     core.exportVariable(name, value);
   }
   const names = [
-    .../* @__PURE__ */ new Set([...Object.keys(payload.secrets), ...Object.keys(variables)])
+    .../* @__PURE__ */ new Set([...Object.keys(secrets), ...Object.keys(variables)])
   ];
   const suffix = names.length > 0 ? `: ${names.join(", ")}` : "";
   core.info(
-    `Retrieved ${Object.keys(payload.secrets).length} secret(s) and ${Object.keys(variables).length} variable(s) from ${scope}${suffix}`
+    `Retrieved ${Object.keys(secrets).length} secret(s) and ${Object.keys(variables).length} variable(s) from ${scope}${suffix}`
   );
 }
 

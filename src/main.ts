@@ -7,13 +7,12 @@ export interface ActionsCore {
   info(message: string): void;
 }
 
-interface ExchangeResponse {
-  secrets: Record<string, string>;
-  variables?: Record<string, string>;
-  grantedBy: string[];
+interface NamedValue {
+  name: string;
+  value: string;
 }
 
-interface ExchangeError {
+interface ApiError {
   error?: string;
   detail?: string;
 }
@@ -67,31 +66,27 @@ function normalizeUrl(value: string): string {
   return url.toString().replace(/\/+$/, "");
 }
 
-function isEnvironmentRecord(value: unknown): value is Record<string, string> {
+function isNamedValue(value: unknown): value is NamedValue {
   return (
     typeof value === "object" &&
     value !== null &&
     !Array.isArray(value) &&
-    Object.entries(value).every(
-      ([name, entry]) =>
-        /^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && typeof entry === "string",
-    )
+    typeof (value as Partial<NamedValue>).name === "string" &&
+    /^[A-Za-z_][A-Za-z0-9_]*$/.test((value as NamedValue).name) &&
+    typeof (value as Partial<NamedValue>).value === "string"
   );
 }
 
-function isExchangeResponse(value: unknown): value is ExchangeResponse {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return false;
-  }
-
-  const response = value as Partial<ExchangeResponse>;
+function readNamedValues(value: unknown, key: "secrets" | "variables"): NamedValue[] | null {
   return (
-    isEnvironmentRecord(response.secrets) &&
-    (response.variables === undefined ||
-      isEnvironmentRecord(response.variables)) &&
-    Array.isArray(response.grantedBy) &&
-    response.grantedBy.every((entry) => typeof entry === "string")
-  );
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    Array.isArray((value as Record<string, unknown>)[key]) &&
+    (value as Record<string, unknown[]>)[key].every(isNamedValue)
+  )
+    ? ((value as Record<string, NamedValue[]>)[key])
+    : null;
 }
 
 async function readJson(response: Response): Promise<unknown> {
@@ -105,7 +100,7 @@ async function readJson(response: Response): Promise<unknown> {
   }
 }
 
-function formatExchangeError(
+function formatApiError(
   response: Response,
   value: unknown,
   endpoint: string,
@@ -113,7 +108,7 @@ function formatExchangeError(
 ): string {
   const error =
     typeof value === "object" && value !== null
-      ? (value as ExchangeError)
+      ? (value as ApiError)
       : undefined;
   const code = typeof error?.error === "string" ? error.error : "unknown_error";
   const detail = typeof error?.detail === "string" ? `: ${error.detail}` : "";
@@ -123,8 +118,8 @@ function formatExchangeError(
     response.headers.get("traceparent") ??
     "unavailable";
   return (
-    `Skipjack rejected the exchange (HTTP ${response.status}, ${code})` +
-    `${detail}; scope=${scope}; endpoint=POST ${endpoint}; ` +
+    `Skipjack API request failed (HTTP ${response.status}, ${code})` +
+    `${detail}; scope=${scope}; endpoint=GET ${endpoint}; ` +
     `request-id=${requestId}`
   );
 }
@@ -150,11 +145,27 @@ export async function run({
   const org = configuredOrg || defaults!.org;
   const project = configuredProject || defaults!.project;
   const audience = core.getInput("audience") || url;
-  const endpoint = `${url}/oidc/secrets`;
   const scope = `${org}/${project}`;
+  const orgBase = `${url}/v1/orgs/${encodeURIComponent(org)}`;
+  const projectBase =
+    `${orgBase}/projects/${encodeURIComponent(project)}`;
+  const requests = [
+    { endpoint: `${orgBase}/secrets`, key: "secrets" as const, scope: org },
+    { endpoint: `${orgBase}/variables`, key: "variables" as const, scope: org },
+    {
+      endpoint: `${projectBase}/secrets`,
+      key: "secrets" as const,
+      scope,
+    },
+    {
+      endpoint: `${projectBase}/variables`,
+      key: "variables" as const,
+      scope,
+    },
+  ];
 
   core.info(
-    `Requesting Skipjack exchange: endpoint=POST ${endpoint}; ` +
+    `Requesting Skipjack resources from the /v1 workload identity API: ` +
       `scope=${scope}; audience=${audience}; ` +
       `repository=${repository ?? "unset"}; ref=${ref ?? "unset"}; ` +
       `workflow=${workflow ?? "unset"}; job=${job ?? "unset"}; ` +
@@ -174,59 +185,89 @@ export async function run({
     return;
   }
 
-  const response = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      accept: "application/json",
-    },
-    body: JSON.stringify({
-      token: idToken,
-      org,
-      project,
+  const results = await Promise.all(
+    requests.map(async (request) => {
+      const response = await fetch(request.endpoint, {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${idToken}`,
+          accept: "application/json",
+        },
+      });
+      const requestId =
+        response.headers.get("x-request-id") ??
+        response.headers.get("cf-ray") ??
+        response.headers.get("traceparent") ??
+        "unavailable";
+      core.info(
+        `Skipjack API response: HTTP ${response.status}; ` +
+          `endpoint=GET ${request.endpoint}; ` +
+          `content-type=${response.headers.get("content-type") ?? "unset"}; ` +
+          `request-id=${requestId}`,
+      );
+      return { ...request, response, payload: await readJson(response) };
     }),
-  });
-
-  const requestId =
-    response.headers.get("x-request-id") ??
-    response.headers.get("cf-ray") ??
-    response.headers.get("traceparent") ??
-    "unavailable";
-  core.info(
-    `Skipjack exchange response: HTTP ${response.status}; ` +
-      `content-type=${response.headers.get("content-type") ?? "unset"}; ` +
-      `request-id=${requestId}`,
   );
 
-  const payload = await readJson(response);
-  if (!response.ok) {
-    core.setFailed(formatExchangeError(response, payload, endpoint, scope));
-    return;
+  for (const result of results) {
+    if (!result.response.ok) {
+      core.setFailed(
+        formatApiError(
+          result.response,
+          result.payload,
+          result.endpoint,
+          result.scope,
+        ),
+      );
+      return;
+    }
   }
-  if (!isExchangeResponse(payload)) {
-    core.setFailed("Skipjack returned an invalid exchange response");
+
+  const parsed = results.map((result) => ({
+    ...result,
+    values: readNamedValues(result.payload, result.key),
+  }));
+  const invalid = parsed.find((result) => result.values === null);
+  if (invalid) {
+    core.setFailed(
+      `Skipjack returned an invalid ${invalid.key} response; ` +
+        `endpoint=GET ${invalid.endpoint}`,
+    );
     return;
   }
 
-  const variables = payload.variables ?? {};
+  const orgSecrets = parsed[0].values!;
+  const orgVariables = parsed[1].values!;
+  const projectSecrets = parsed[2].values!;
+  const projectVariables = parsed[3].values!;
+  const secrets: Record<string, string> = {};
+  const variables: Record<string, string> = {};
+
+  // Organization values form the base; project values intentionally win.
+  for (const entry of [...orgSecrets, ...projectSecrets]) {
+    secrets[entry.name] = entry.value;
+  }
+  for (const entry of [...orgVariables, ...projectVariables]) {
+    variables[entry.name] = entry.value;
+  }
 
   // Register every secret with the runner before exporting any returned value.
-  for (const value of Object.values(payload.secrets)) core.setSecret(value);
+  for (const value of Object.values(secrets)) core.setSecret(value);
 
   // A same-named secret intentionally wins over a non-secret variable.
   for (const [name, value] of Object.entries(variables)) {
     core.exportVariable(name, value);
   }
-  for (const [name, value] of Object.entries(payload.secrets)) {
+  for (const [name, value] of Object.entries(secrets)) {
     core.exportVariable(name, value);
   }
 
   const names = [
-    ...new Set([...Object.keys(payload.secrets), ...Object.keys(variables)]),
+    ...new Set([...Object.keys(secrets), ...Object.keys(variables)]),
   ];
   const suffix = names.length > 0 ? `: ${names.join(", ")}` : "";
   core.info(
-    `Retrieved ${Object.keys(payload.secrets).length} secret(s) and ` +
+    `Retrieved ${Object.keys(secrets).length} secret(s) and ` +
       `${Object.keys(variables).length} variable(s) from ${scope}${suffix}`,
   );
 }

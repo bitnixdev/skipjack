@@ -21,19 +21,82 @@ function createCore(inputs: Record<string, string>) {
   return { core, events };
 }
 
+function resourceUrls(
+  base: string,
+  org: string,
+  project: string,
+): [string, string, string, string] {
+  const orgBase = `${base}/v1/orgs/${org}`;
+  const projectBase = `${orgBase}/projects/${project}`;
+  return [
+    `${orgBase}/secrets`,
+    `${orgBase}/variables`,
+    `${projectBase}/secrets`,
+    `${projectBase}/variables`,
+  ];
+}
+
+function emptyResourceFetch(base: string, org: string, project: string) {
+  const [orgSecrets, orgVariables, projectSecrets, projectVariables] =
+    resourceUrls(base, org, project);
+  const responses = new Map<string, unknown>([
+    [orgSecrets, { secrets: [] }],
+    [orgVariables, { variables: [] }],
+    [projectSecrets, { secrets: [] }],
+    [projectVariables, { variables: [] }],
+  ]);
+  return vi.fn<Fetch>(async (input) => {
+    const body = responses.get(String(input));
+    return body === undefined
+      ? Response.json({ error: "not_found" }, { status: 404 })
+      : Response.json(body);
+  });
+}
+
 describe("run", () => {
-  it("exchanges an OIDC token, masks secrets, and exports returned values", async () => {
+  it("reads org and project resources, merges project values, masks secrets, and exports values", async () => {
     const { core, events } = createCore({
       url: "https://skipjack.example.com/",
       org: "acme",
       project: "shared-ci",
     });
-    const fetch = vi.fn<Fetch>(async () =>
-      Response.json({
-        secrets: { TOKEN: "secret", SHARED: "secret-wins" },
-        variables: { REGION: "us-west-2", SHARED: "variable-loses" },
-        grantedBy: ["policy-1"],
-      }),
+    const [orgSecrets, orgVariables, projectSecrets, projectVariables] =
+      resourceUrls("https://skipjack.example.com", "acme", "shared-ci");
+    const responses = new Map<string, unknown>([
+      [
+        orgSecrets,
+        {
+          secrets: [
+            { name: "ORG_TOKEN", value: "org-secret", version: 1 },
+            { name: "SHARED", value: "org-loses", version: 1 },
+          ],
+        },
+      ],
+      [
+        orgVariables,
+        {
+          variables: [
+            { name: "REGION", value: "us-east-1" },
+            { name: "SHARED", value: "variable-loses" },
+          ],
+        },
+      ],
+      [
+        projectSecrets,
+        {
+          secrets: [
+            { name: "TOKEN", value: "project-secret", version: 2 },
+            { name: "SHARED", value: "project-wins", version: 3 },
+          ],
+        },
+      ],
+      [
+        projectVariables,
+        { variables: [{ name: "REGION", value: "us-west-2" }] },
+      ],
+    ]);
+    const fetch = vi.fn<Fetch>(async (input) =>
+      Response.json(responses.get(String(input))),
     );
 
     await run({
@@ -49,25 +112,31 @@ describe("run", () => {
     });
 
     expect(core.getIDToken).toHaveBeenCalledWith("https://skipjack.example.com");
-    expect(fetch).toHaveBeenCalledOnce();
-    const [url, request] = fetch.mock.calls[0];
-    expect(url).toBe("https://skipjack.example.com/oidc/secrets");
-    expect(request).toMatchObject({
-      method: "POST",
-      headers: { "content-type": "application/json", accept: "application/json" },
-    });
-    expect(JSON.parse(String(request?.body))).toEqual({
-      token: "oidc-token",
-      org: "acme",
-      project: "shared-ci",
-    });
+    expect(fetch).toHaveBeenCalledTimes(4);
+    expect(fetch.mock.calls.map(([url]) => url)).toEqual([
+      orgSecrets,
+      orgVariables,
+      projectSecrets,
+      projectVariables,
+    ]);
+    for (const [, request] of fetch.mock.calls) {
+      expect(request).toMatchObject({
+        method: "GET",
+        headers: {
+          authorization: "Bearer oidc-token",
+          accept: "application/json",
+        },
+      });
+    }
     expect(events).toEqual([
-      "mask:secret",
-      "mask:secret-wins",
+      "mask:org-secret",
+      "mask:project-wins",
+      "mask:project-secret",
       "env:REGION:us-west-2",
       "env:SHARED:variable-loses",
-      "env:TOKEN:secret",
-      "env:SHARED:secret-wins",
+      "env:ORG_TOKEN:org-secret",
+      "env:SHARED:project-wins",
+      "env:TOKEN:project-secret",
     ]);
     expect(core.info).toHaveBeenCalledWith(
       expect.stringContaining(
@@ -80,25 +149,28 @@ describe("run", () => {
       ),
     );
     expect(core.info).toHaveBeenCalledWith(
-      expect.stringContaining("Skipjack exchange response: HTTP 200"),
+      expect.stringContaining("Skipjack API response: HTTP 200"),
     );
     const logs = vi
       .mocked(core.info)
       .mock.calls.flat()
       .map(String)
       .join("\n");
+    expect(logs).toContain("ORG_TOKEN");
     expect(logs).toContain("TOKEN");
     expect(logs).toContain("REGION");
     expect(logs).not.toContain("oidc-token");
-    expect(logs).not.toContain("secret-wins");
+    expect(logs).not.toContain("project-wins");
     expect(logs).not.toContain("us-west-2");
     expect(core.setFailed).not.toHaveBeenCalled();
   });
 
   it("defaults URL, organization, and project from the GitHub repository", async () => {
     const { core } = createCore({});
-    const fetch = vi.fn<Fetch>(async () =>
-      Response.json({ secrets: {}, variables: {}, grantedBy: [] }),
+    const fetch = emptyResourceFetch(
+      "https://skipjack.bitnix.dev",
+      "bitnixdev",
+      "skipjack",
     );
 
     await run({ core, fetch, repository: "BitnixDev/Skipjack" });
@@ -106,13 +178,13 @@ describe("run", () => {
     expect(core.getIDToken).toHaveBeenCalledWith(
       "https://skipjack.bitnix.dev",
     );
-    const [url, request] = fetch.mock.calls[0];
-    expect(url).toBe("https://skipjack.bitnix.dev/oidc/secrets");
-    expect(JSON.parse(String(request?.body))).toEqual({
-      token: "oidc-token",
-      org: "bitnixdev",
-      project: "skipjack",
-    });
+    expect(fetch.mock.calls.map(([url]) => url)).toEqual(
+      resourceUrls(
+        "https://skipjack.bitnix.dev",
+        "bitnixdev",
+        "skipjack",
+      ),
+    );
   });
 
   it("supports explicit scope and audience overrides", async () => {
@@ -122,19 +194,16 @@ describe("run", () => {
       project: "shared-ci",
       audience: "skipjack-production",
     });
-    const fetch = vi.fn<Fetch>(async () =>
-      Response.json({ secrets: {}, variables: {}, grantedBy: [] }),
+    const fetch = emptyResourceFetch(
+      "https://skipjack.example.com/base",
+      "acme",
+      "shared-ci",
     );
 
     await run({ core, fetch });
 
     expect(core.getIDToken).toHaveBeenCalledWith("skipjack-production");
-    const [, request] = fetch.mock.calls[0];
-    expect(JSON.parse(String(request?.body))).toEqual({
-      token: "oidc-token",
-      org: "acme",
-      project: "shared-ci",
-    });
+    expect(fetch).toHaveBeenCalledTimes(4);
     expect(events).toEqual([]);
   });
 
@@ -170,26 +239,40 @@ describe("run", () => {
     );
   });
 
-  it("reports structured server errors without exporting values", async () => {
+  it("reports structured API errors without exporting values", async () => {
     const { core, events } = createCore({
       url: "https://skipjack.example.com",
       org: "acme",
       project: "shared-ci",
     });
-    const fetch = vi.fn<Fetch>(async () =>
-      Response.json(
-        { error: "no_policy_matched", detail: "repo:acme/example" },
-        { status: 403 },
-      ),
+    const [failedUrl] = resourceUrls(
+      "https://skipjack.example.com",
+      "acme",
+      "shared-ci",
+    );
+    const fetch = vi.fn<Fetch>(async (input) =>
+      String(input) === failedUrl
+        ? Response.json(
+            { error: "forbidden", detail: "secrets:r is required" },
+            {
+              status: 403,
+              headers: { "x-request-id": "request-123" },
+            },
+          )
+        : Response.json(
+            String(input).endsWith("/secrets")
+              ? { secrets: [] }
+              : { variables: [] },
+          ),
     );
 
     await run({ core, fetch });
 
     expect(core.setFailed).toHaveBeenCalledWith(
-      "Skipjack rejected the exchange (HTTP 403, no_policy_matched): " +
-        "repo:acme/example; scope=acme/shared-ci; " +
-        "endpoint=POST https://skipjack.example.com/oidc/secrets; " +
-        "request-id=unavailable",
+      "Skipjack API request failed (HTTP 403, forbidden): " +
+        "secrets:r is required; scope=acme; " +
+        "endpoint=GET https://skipjack.example.com/v1/orgs/acme/secrets; " +
+        "request-id=request-123",
     );
     expect(events).toEqual([]);
   });
@@ -200,14 +283,18 @@ describe("run", () => {
       org: "acme",
       project: "shared-ci",
     });
-    const fetch = vi.fn<Fetch>(async () =>
-      Response.json({ secrets: { TOKEN: 123 } }),
+    const fetch = vi.fn<Fetch>(async (input) =>
+      Response.json(
+        String(input).endsWith("/secrets")
+          ? { secrets: { TOKEN: "not-an-array" } }
+          : { variables: [] },
+      ),
     );
 
     await run({ core, fetch });
 
     expect(core.setFailed).toHaveBeenCalledWith(
-      "Skipjack returned an invalid exchange response",
+      expect.stringContaining("invalid secrets response"),
     );
     expect(events).toEqual([]);
   });
@@ -218,18 +305,18 @@ describe("run", () => {
       org: "acme",
       project: "shared-ci",
     });
-    const fetch = vi.fn<Fetch>(async () =>
-      Response.json({
-        secrets: {},
-        variables: { "BAD\nNAME": "injected" },
-        grantedBy: [],
-      }),
+    const fetch = vi.fn<Fetch>(async (input) =>
+      Response.json(
+        String(input).endsWith("/secrets")
+          ? { secrets: [] }
+          : { variables: [{ name: "BAD\nNAME", value: "injected" }] },
+      ),
     );
 
     await run({ core, fetch });
 
     expect(core.setFailed).toHaveBeenCalledWith(
-      "Skipjack returned an invalid exchange response",
+      expect.stringContaining("invalid variables response"),
     );
     expect(events).toEqual([]);
   });
