@@ -17,7 +17,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - uses: bitnixdev/skipjack@v1
+      - uses: bitnixdev/skipjack@v2026
       - run: ./deploy.sh
         # Granted secrets and variables are available as environment variables.
 ```
