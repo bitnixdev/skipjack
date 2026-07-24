@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --platform=node --target=node24 --format=cjs --outfile=dist/index.js",
+    "build": "esbuild src/index.ts --bundle --platform=node --target=node24 --format=cjs --outfile=dist/index.cjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "check": "npm run typecheck && npm test && npm run build"

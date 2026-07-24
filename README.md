@@ -59,5 +59,5 @@ npm ci
 npm run check
 ```
 
-`dist/index.js` is committed because GitHub executes the checked-in bundle.
+`dist/index.cjs` is committed because GitHub executes the checked-in bundle.
 After changing `src/`, run `npm run build` and commit the updated bundle.
