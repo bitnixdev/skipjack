@@ -36,7 +36,17 @@ describe("run", () => {
       }),
     );
 
-    await run({ core, fetch });
+    await run({
+      core,
+      fetch,
+      repository: "acme/shared-ci",
+      ref: "refs/heads/main",
+      workflow: "deploy",
+      job: "deploy",
+      runId: "123",
+      runAttempt: "1",
+      eventName: "push",
+    });
 
     expect(core.getIDToken).toHaveBeenCalledWith("https://skipjack.example.com");
     expect(fetch).toHaveBeenCalledOnce();
@@ -59,6 +69,29 @@ describe("run", () => {
       "env:TOKEN:secret",
       "env:SHARED:secret-wins",
     ]);
+    expect(core.info).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "scope=acme/shared-ci; audience=https://skipjack.example.com",
+      ),
+    );
+    expect(core.info).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "repository=acme/shared-ci; ref=refs/heads/main; workflow=deploy",
+      ),
+    );
+    expect(core.info).toHaveBeenCalledWith(
+      expect.stringContaining("Skipjack exchange response: HTTP 200"),
+    );
+    const logs = vi
+      .mocked(core.info)
+      .mock.calls.flat()
+      .map(String)
+      .join("\n");
+    expect(logs).toContain("TOKEN");
+    expect(logs).toContain("REGION");
+    expect(logs).not.toContain("oidc-token");
+    expect(logs).not.toContain("secret-wins");
+    expect(logs).not.toContain("us-west-2");
     expect(core.setFailed).not.toHaveBeenCalled();
   });
 
@@ -153,7 +186,10 @@ describe("run", () => {
     await run({ core, fetch });
 
     expect(core.setFailed).toHaveBeenCalledWith(
-      "Skipjack rejected the exchange (HTTP 403, no_policy_matched): repo:acme/example",
+      "Skipjack rejected the exchange (HTTP 403, no_policy_matched): " +
+        "repo:acme/example; scope=acme/shared-ci; " +
+        "endpoint=POST https://skipjack.example.com/oidc/secrets; " +
+        "request-id=unavailable",
     );
     expect(events).toEqual([]);
   });

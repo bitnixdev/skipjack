@@ -21071,16 +21071,23 @@ async function readJson(response) {
     return void 0;
   }
 }
-function formatExchangeError(status, value) {
+function formatExchangeError(response, value, endpoint, scope) {
   const error2 = typeof value === "object" && value !== null ? value : void 0;
   const code = typeof error2?.error === "string" ? error2.error : "unknown_error";
   const detail = typeof error2?.detail === "string" ? `: ${error2.detail}` : "";
-  return `Skipjack rejected the exchange (HTTP ${status}, ${code})${detail}`;
+  const requestId = response.headers.get("x-request-id") ?? response.headers.get("cf-ray") ?? response.headers.get("traceparent") ?? "unavailable";
+  return `Skipjack rejected the exchange (HTTP ${response.status}, ${code})${detail}; scope=${scope}; endpoint=POST ${endpoint}; request-id=${requestId}`;
 }
 async function run({
   core,
   fetch,
-  repository
+  repository,
+  ref,
+  workflow,
+  job,
+  runId,
+  runAttempt,
+  eventName
 }) {
   const url = normalizeUrl(core.getInput("url") || DEFAULT_URL);
   const configuredOrg = core.getInput("org");
@@ -21089,6 +21096,11 @@ async function run({
   const org = configuredOrg || defaults.org;
   const project = configuredProject || defaults.project;
   const audience = core.getInput("audience") || url;
+  const endpoint = `${url}/oidc/secrets`;
+  const scope = `${org}/${project}`;
+  core.info(
+    `Requesting Skipjack exchange: endpoint=POST ${endpoint}; scope=${scope}; audience=${audience}; repository=${repository ?? "unset"}; ref=${ref ?? "unset"}; workflow=${workflow ?? "unset"}; job=${job ?? "unset"}; run=${runId ?? "unset"}; attempt=${runAttempt ?? "unset"}; event=${eventName ?? "unset"}`
+  );
   let idToken;
   try {
     idToken = await core.getIDToken(audience);
@@ -21098,7 +21110,7 @@ async function run({
     );
     return;
   }
-  const response = await fetch(`${url}/oidc/secrets`, {
+  const response = await fetch(endpoint, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -21110,9 +21122,13 @@ async function run({
       project
     })
   });
+  const requestId = response.headers.get("x-request-id") ?? response.headers.get("cf-ray") ?? response.headers.get("traceparent") ?? "unavailable";
+  core.info(
+    `Skipjack exchange response: HTTP ${response.status}; content-type=${response.headers.get("content-type") ?? "unset"}; request-id=${requestId}`
+  );
   const payload = await readJson(response);
   if (!response.ok) {
-    core.setFailed(formatExchangeError(response.status, payload));
+    core.setFailed(formatExchangeError(response, payload, endpoint, scope));
     return;
   }
   if (!isExchangeResponse(payload)) {
@@ -21130,7 +21146,6 @@ async function run({
   const names = [
     .../* @__PURE__ */ new Set([...Object.keys(payload.secrets), ...Object.keys(variables)])
   ];
-  const scope = `${org}/${project}`;
   const suffix = names.length > 0 ? `: ${names.join(", ")}` : "";
   core.info(
     `Retrieved ${Object.keys(payload.secrets).length} secret(s) and ${Object.keys(variables).length} variable(s) from ${scope}${suffix}`
@@ -21141,7 +21156,13 @@ async function run({
 run({
   core: core_exports,
   fetch: globalThis.fetch,
-  repository: process.env.GITHUB_REPOSITORY
+  repository: process.env.GITHUB_REPOSITORY,
+  ref: process.env.GITHUB_REF,
+  workflow: process.env.GITHUB_WORKFLOW,
+  job: process.env.GITHUB_JOB,
+  runId: process.env.GITHUB_RUN_ID,
+  runAttempt: process.env.GITHUB_RUN_ATTEMPT,
+  eventName: process.env.GITHUB_EVENT_NAME
 }).catch((error2) => {
   setFailed(error2 instanceof Error ? error2 : String(error2));
 });
